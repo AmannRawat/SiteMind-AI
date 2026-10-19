@@ -133,98 +133,327 @@ export async function crawlWebsite(startUrl, options = {}) {
         checkDeadline();
     }
 
-    async function visitPage(pageUrl, depth) {
-        checkDeadline();
+    const queue = [{ url: start, depth: 0 }];
+    const queued = new Set([start]);
 
-        let normalizedUrl;
-
-        try {
-            normalizedUrl = normalizeUrl(pageUrl);
-        } catch (error) {
-            failedPages++;
-            console.warn(
-                `[Crawler] Invalid URL skipped: ${error.message}`
-            );
-            return;
-        }
-
-        if (
-            visited.has(normalizedUrl) ||
-            visited.size >= maxPages ||
-            depth > maxDepth
-        ) {
-            return;
-        }
-
-        // Never crawl outside the starting origin.
-        if (new URL(normalizedUrl).origin !== allowedOrigin) {
-            return;
-        }
-
-        try {
-            await validatePublicHttpUrl(normalizedUrl);
+    try {
+        while (queue.length > 0) {
             checkDeadline();
-        } catch (error) {
-            if (error instanceof CrawlDeadlineError) {
-                throw error;
-            }
 
-            if (depth === 0) {
-                throw new Error(
-                    `Starting URL failed security validation: ${error.message}`
+            if (visited.size >= maxPages) break;
+
+            const { url: currentUrl, depth } = queue.shift();
+
+            let normalizedUrl;
+
+            try {
+                normalizedUrl = normalizeUrl(currentUrl);
+            } catch (error) {
+                failedPages++;
+                console.warn(
+                    `[Crawler] Invalid URL skipped: ${error.message}`
                 );
+                continue;
             }
 
-            failedPages++;
-
-            console.warn(
-                `[Crawler] Unsafe or unreachable URL skipped: ${normalizedUrl}`
-            );
-
-            return;
-        }
-
-        // Add before processing to prevent duplicate traversal.
-        visited.add(normalizedUrl);
-
-        let checkpoint;
-
-        try {
-            checkpoint = await getPageCheckpoint(jobId, normalizedUrl);
-            checkDeadline();
-        } catch (error) {
-            if (error instanceof CrawlDeadlineError) {
-                throw error;
+            if (
+                visited.has(normalizedUrl) ||
+                visited.size >= maxPages ||
+                depth > maxDepth
+            ) {
+                continue;
             }
 
-            failedPages++;
+            // Never crawl outside the starting origin.
+            if (new URL(normalizedUrl).origin !== allowedOrigin) {
+                continue;
+            }
 
-            console.error(
-                `[Crawler] Checkpoint lookup failed for ${normalizedUrl}: ${error.message}`
-            );
+            try {
+                await validatePublicHttpUrl(normalizedUrl);
+                checkDeadline();
+            } catch (error) {
+                if (error instanceof CrawlDeadlineError) {
+                    throw error;
+                }
 
-            return;
-        }
+                if (depth === 0) {
+                    throw new Error(
+                        `Starting URL failed security validation: ${error.message}`
+                    );
+                }
 
-        // Resume previously completed pages without repeating embeddings.
-        if (
-            checkpoint &&
-            Array.isArray(checkpoint.internalLinks) &&
-            Number.isInteger(checkpoint.indexedChunks)
-        ) {
-            console.log(
-                `[Crawler] Resuming job ${jobId}: skipping ${normalizedUrl}`
-            );
+                failedPages++;
 
-            processedPages++;
-            indexedChunks += checkpoint.indexedChunks;
+                console.warn(
+                    `[Crawler] Unsafe or unreachable URL skipped: ${normalizedUrl}`
+                );
 
-            await reportProgress();
+                continue;
+            }
 
-            for (const link of checkpoint.internalLinks) {
+            // Add before processing to prevent duplicate traversal.
+            visited.add(normalizedUrl);
+
+            let checkpoint;
+
+            try {
+                checkpoint = await getPageCheckpoint(jobId, normalizedUrl);
+                checkDeadline();
+            } catch (error) {
+                if (error instanceof CrawlDeadlineError) {
+                    throw error;
+                }
+
+                failedPages++;
+
+                console.error(
+                    `[Crawler] Checkpoint lookup failed for ${normalizedUrl}: ${error.message}`
+                );
+
+                continue;
+            }
+
+            // Resume previously completed pages without repeating embeddings.
+            if (
+                checkpoint &&
+                Array.isArray(checkpoint.internalLinks) &&
+                Number.isInteger(checkpoint.indexedChunks)
+            ) {
+                console.log(
+                    `[Crawler] Resuming job ${jobId}: skipping ${normalizedUrl}`
+                );
+
+                processedPages++;
+                indexedChunks += checkpoint.indexedChunks;
+
+                await reportProgress();
+
+                for (const link of checkpoint.internalLinks) {
+                    checkDeadline();
+
+                    if (visited.size >= maxPages || depth + 1 > maxDepth) break;
+
+                    let nextUrl;
+
+                    try {
+                        nextUrl = normalizeUrl(
+                            new URL(link, normalizedUrl).href
+                        );
+                    } catch {
+                        continue;
+                    }
+
+                    if (new URL(nextUrl).origin === allowedOrigin) {
+                        if (!visited.has(nextUrl) && !queued.has(nextUrl)) {
+                            queued.add(nextUrl);
+                            queue.push({ url: nextUrl, depth: depth + 1 });
+                        }
+                    }
+                }
+
+                continue;
+            }
+
+            console.log(`[Crawler] Crawling: ${normalizedUrl}`);
+
+            let scraped;
+
+            try {
+                // Axios + Cheerio first; Puppeteer fallback is handled
+                // inside scrapeWebsite().
+                scraped = await scrapeWebsite(normalizedUrl);
+                checkDeadline();
+            } catch (error) {
+                if (error instanceof CrawlDeadlineError) {
+                    throw error;
+                }
+
+                failedPages++;
+
+                console.error(
+                    `[Crawler] Failed to scrape ${normalizedUrl}: ${error.message}`
+                );
+
+                continue;
+            }
+
+            const head =
+                typeof scraped.head === "string" ? scraped.head : "";
+
+            const body =
+                typeof scraped.body === "string" ? scraped.body : "";
+
+            const internalLinks = Array.isArray(scraped.internalLinks)
+                ? scraped.internalLinks
+                : [];
+
+            // Do not embed pages that contain no useful text.
+            if (!head.trim() && !body.trim()) {
+                failedPages++;
+
+                console.warn(
+                    `[Crawler] No readable content extracted: ${normalizedUrl}`
+                );
+
+                continue;
+            }
+
+            const contentHash = hashPageContent(head, body);
+
+            let previousState;
+
+            try {
+                previousState = await getPageState(normalizedUrl);
+                checkDeadline();
+            } catch (error) {
+                if (error instanceof CrawlDeadlineError) {
+                    throw error;
+                }
+
+                failedPages++;
+
+                console.error(
+                    `[Crawler] Page-state lookup failed for ${normalizedUrl}: ${error.message}`
+                );
+
+                continue;
+            }
+
+            let pageIndexedChunks = 0;
+
+            if (
+                previousState?.contentHash === contentHash &&
+                Array.isArray(previousState.chunkIds) &&
+                Number.isInteger(previousState.indexedChunks)
+            ) {
+                console.log(
+                    `[Crawler] Unchanged page; skipping embeddings: ${normalizedUrl}`
+                );
+
+                pageIndexedChunks = previousState.indexedChunks;
+                indexedChunks += pageIndexedChunks;
+            } else {
+                const newChunkIds = [];
+
+                try {
+                    // Index the heading separately when present.
+                    if (head.trim()) {
+                        checkDeadline();
+
+                        const id = `${normalizedUrl}::${contentHash}::head`;
+                        const embedding = await generateVectorEmbedding(head);
+
+                        checkDeadline();
+
+                        await storeChunk({
+                            id,
+                            embedding,
+                            url: normalizedUrl,
+                            websiteUrl: allowedOrigin,
+                            text: head,
+                            title: "",
+                        });
+
+                        checkDeadline();
+                        newChunkIds.push(id);
+                    }
+
+                    const chunks = chunkText(body);
+
+                    for (const [index, chunk] of chunks.entries()) {
+                        checkDeadline();
+
+                        if (!chunk.trim()) continue;
+
+                        const id =
+                            `${normalizedUrl}::${contentHash}::chunk-${index}`;
+
+                        const embedding = await generateVectorEmbedding(chunk);
+
+                        checkDeadline();
+
+                        await storeChunk({
+                            id,
+                            embedding,
+                            url: normalizedUrl,
+                            websiteUrl: allowedOrigin,
+                            text: chunk,
+                            title: "",
+                        });
+
+                        checkDeadline();
+
+                        newChunkIds.push(id);
+                        indexedChunks++;
+                        pageIndexedChunks++;
+                    }
+
+                    // Delete stale chunks only after the new chunks have
+                    // been written successfully.
+                    checkDeadline();
+
+                    const oldChunkIds = Array.isArray(previousState?.chunkIds)
+                        ? previousState.chunkIds
+                        : [];
+
+                    const newChunkIdSet = new Set(newChunkIds);
+
+                    const staleChunkIds = oldChunkIds.filter(
+                        (id) => !newChunkIdSet.has(id)
+                    );
+
+                    await deleteChunks(staleChunkIds);
+                    checkDeadline();
+
+                    await savePageState(normalizedUrl, {
+                        contentHash,
+                        chunkIds: newChunkIds,
+                        indexedChunks: pageIndexedChunks,
+                    });
+
+                    checkDeadline();
+                } catch (error) {
+                    // Infrastructure failures must reach BullMQ so the job can be retried.
+                    // Do not save the page state or checkpoint for a failed indexing attempt.
+                    console.error(
+                        `[Crawler] Failed to index ${normalizedUrl}: ${error.message}`
+                    );
+                    throw error;
+                }
+            }
+
+            // Save the checkpoint after successful indexing.
+            try {
                 checkDeadline();
 
-                if (visited.size >= maxPages) break;
+                await savePageCheckpoint(jobId, normalizedUrl, {
+                    indexedChunks: pageIndexedChunks,
+                    internalLinks,
+                });
+
+                checkDeadline();
+            } catch (error) {
+                if (error instanceof CrawlDeadlineError) {
+                    throw error;
+                }
+
+                failedPages++;
+
+                console.error(
+                    `[Crawler] Failed to save checkpoint for ${normalizedUrl}: ${error.message}`
+                );
+
+                continue;
+            }
+
+            processedPages++;
+            await reportProgress();
+
+            for (const link of internalLinks) {
+                checkDeadline();
+
+                if (visited.size >= maxPages || depth + 1 > maxDepth) break;
 
                 let nextUrl;
 
@@ -237,231 +466,13 @@ export async function crawlWebsite(startUrl, options = {}) {
                 }
 
                 if (new URL(nextUrl).origin === allowedOrigin) {
-                    await visitPage(nextUrl, depth + 1);
+                    if (!visited.has(nextUrl) && !queued.has(nextUrl)) {
+                        queued.add(nextUrl);
+                        queue.push({ url: nextUrl, depth: depth + 1 });
+                    }
                 }
             }
-
-            return;
         }
-
-        console.log(`[Crawler] Crawling: ${normalizedUrl}`);
-
-        let scraped;
-
-        try {
-            // Axios + Cheerio first; Puppeteer fallback is handled
-            // inside scrapeWebsite().
-            scraped = await scrapeWebsite(normalizedUrl);
-            checkDeadline();
-        } catch (error) {
-            if (error instanceof CrawlDeadlineError) {
-                throw error;
-            }
-
-            failedPages++;
-
-            console.error(
-                `[Crawler] Failed to scrape ${normalizedUrl}: ${error.message}`
-            );
-
-            return;
-        }
-
-        const head =
-            typeof scraped.head === "string" ? scraped.head : "";
-
-        const body =
-            typeof scraped.body === "string" ? scraped.body : "";
-
-        const internalLinks = Array.isArray(scraped.internalLinks)
-            ? scraped.internalLinks
-            : [];
-
-        // Do not embed pages that contain no useful text.
-        if (!head.trim() && !body.trim()) {
-            failedPages++;
-
-            console.warn(
-                `[Crawler] No readable content extracted: ${normalizedUrl}`
-            );
-
-            return;
-        }
-
-        const contentHash = hashPageContent(head, body);
-
-        let previousState;
-
-        try {
-            previousState = await getPageState(normalizedUrl);
-            checkDeadline();
-        } catch (error) {
-            if (error instanceof CrawlDeadlineError) {
-                throw error;
-            }
-
-            failedPages++;
-
-            console.error(
-                `[Crawler] Page-state lookup failed for ${normalizedUrl}: ${error.message}`
-            );
-
-            return;
-        }
-
-        let pageIndexedChunks = 0;
-
-        if (
-            previousState?.contentHash === contentHash &&
-            Array.isArray(previousState.chunkIds) &&
-            Number.isInteger(previousState.indexedChunks)
-        ) {
-            console.log(
-                `[Crawler] Unchanged page; skipping embeddings: ${normalizedUrl}`
-            );
-
-            pageIndexedChunks = previousState.indexedChunks;
-            indexedChunks += pageIndexedChunks;
-        } else {
-            const newChunkIds = [];
-
-            try {
-                // Index the heading separately when present.
-                if (head.trim()) {
-                    checkDeadline();
-
-                    const id = `${normalizedUrl}::${contentHash}::head`;
-                    const embedding = await generateVectorEmbedding(head);
-
-                    checkDeadline();
-
-                    await storeChunk({
-                        id,
-                        embedding,
-                        url: normalizedUrl,
-                        websiteUrl: allowedOrigin,
-                        text: head,
-                        title: "",
-                    });
-
-                    checkDeadline();
-                    newChunkIds.push(id);
-                }
-
-                const chunks = chunkText(body);
-
-                for (const [index, chunk] of chunks.entries()) {
-                    checkDeadline();
-
-                    if (!chunk.trim()) continue;
-
-                    const id =
-                        `${normalizedUrl}::${contentHash}::chunk-${index}`;
-
-                    const embedding = await generateVectorEmbedding(chunk);
-
-                    checkDeadline();
-
-                    await storeChunk({
-                        id,
-                        embedding,
-                        url: normalizedUrl,
-                        websiteUrl: allowedOrigin,
-                        text: chunk,
-                        title: "",
-                    });
-
-                    checkDeadline();
-
-                    newChunkIds.push(id);
-                    indexedChunks++;
-                    pageIndexedChunks++;
-                }
-
-                // Delete stale chunks only after the new chunks have
-                // been written successfully.
-                checkDeadline();
-
-                const oldChunkIds = Array.isArray(previousState?.chunkIds)
-                    ? previousState.chunkIds
-                    : [];
-
-                const newChunkIdSet = new Set(newChunkIds);
-
-                const staleChunkIds = oldChunkIds.filter(
-                    (id) => !newChunkIdSet.has(id)
-                );
-
-                await deleteChunks(staleChunkIds);
-                checkDeadline();
-
-                await savePageState(normalizedUrl, {
-                    contentHash,
-                    chunkIds: newChunkIds,
-                    indexedChunks: pageIndexedChunks,
-                });
-
-                checkDeadline();
-            } catch (error) {
-                // Infrastructure failures must reach BullMQ so the job can be retried.
-                // Do not save the page state or checkpoint for a failed indexing attempt.
-                console.error(
-                    `[Crawler] Failed to index ${normalizedUrl}: ${error.message}`
-                );
-                throw error;
-            }
-        }
-
-        // Save the checkpoint after successful indexing.
-        try {
-            checkDeadline();
-
-            await savePageCheckpoint(jobId, normalizedUrl, {
-                indexedChunks: pageIndexedChunks,
-                internalLinks,
-            });
-
-            checkDeadline();
-        } catch (error) {
-            if (error instanceof CrawlDeadlineError) {
-                throw error;
-            }
-
-            failedPages++;
-
-            console.error(
-                `[Crawler] Failed to save checkpoint for ${normalizedUrl}: ${error.message}`
-            );
-
-            return;
-        }
-
-        processedPages++;
-        await reportProgress();
-
-        for (const link of internalLinks) {
-            checkDeadline();
-
-            if (visited.size >= maxPages) break;
-
-            let nextUrl;
-
-            try {
-                nextUrl = normalizeUrl(
-                    new URL(link, normalizedUrl).href
-                );
-            } catch {
-                continue;
-            }
-
-            if (new URL(nextUrl).origin === allowedOrigin) {
-                await visitPage(nextUrl, depth + 1);
-            }
-        }
-    }
-
-    try {
-        await visitPage(start, 0);
     } catch (error) {
         if (!(error instanceof CrawlDeadlineError)) {
             throw error;

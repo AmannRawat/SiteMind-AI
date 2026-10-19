@@ -43,6 +43,7 @@ RUN rm -rf /root/.cache/puppeteer \
 
 ENV NODE_ENV=production
 ENV PUPPETEER_NO_SANDBOX=true
+ENV NODE_OPTIONS="--max-old-space-size=160"
 
 COPY src ./src
 COPY index.js ./index.js

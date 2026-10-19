@@ -15,7 +15,7 @@
     "dev:api": "node --watch src/server.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "start:render": "concurrently --kill-others \"npm run api\" \"npm run worker\""
+    "start:render": "node --max-old-space-size=160 src/render.js"
   },
   "dependencies": {
     "@google/genai": "^2.24.0",

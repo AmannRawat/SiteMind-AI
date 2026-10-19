@@ -25,5 +25,16 @@ async function shutdown(signal) {
   });
 }
 
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const isMainModule =
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+export { server, shutdown };

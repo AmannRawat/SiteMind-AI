@@ -62,17 +62,25 @@ worker.on("error", (error) => {
 
 let shuttingDown = false;
 
-async function shutdown(signal) {
+export async function closeWorker() {
   if (shuttingDown) return;
   shuttingDown = true;
 
+  try {
+    await worker.close();
+    await connection.quit();
+  } catch (error) {
+    console.error("[Worker] Error closing worker/connection:", error.message);
+    throw error;
+  }
+}
+
+export async function shutdown(signal) {
   console.log(`[Worker] Received ${signal}. Shutting down...`);
 
   try {
     // Gracefully stop accepting work and wait for the active job to finish.
-    await worker.close();
-    await connection.quit();
-
+    await closeWorker();
     console.log("[Worker] Shutdown complete.");
     process.exit(0);
   } catch (error) {
@@ -81,5 +89,16 @@ async function shutdown(signal) {
   }
 }
 
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const isMainModule =
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+export { worker, connection };

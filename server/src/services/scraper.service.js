@@ -20,7 +20,7 @@ const MAX_CONCURRENT_BROWSER_SCRAPES = 1;
 const MAX_QUEUED_BROWSER_SCRAPES = 3;
 const BROWSER_QUEUE_WAIT_MS = 10_000;
 
-const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font"]);
+const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font", "stylesheet"]);
 
 // Process-local browser queue
 let activeBrowserScrapes = 0;
@@ -287,12 +287,16 @@ function closeBrowserSafely(browser) {
                 `[Scraper] Browser close failed: ${error.message}`,
             );
 
-            // Best-effort termination of the Chromium process.
+            // Best-effort termination of the Chromium process tree.
             try {
                 const child = browser.process();
 
-                if (child && child.exitCode === null) {
-                    child.kill("SIGKILL");
+                if (child && child.pid && child.exitCode === null) {
+                    try {
+                        process.kill(-child.pid, "SIGKILL");
+                    } catch {
+                        child.kill("SIGKILL");
+                    }
                 }
             } catch {
                 // The process may already have exited.
@@ -348,6 +352,11 @@ export async function scrapeReactWebsite(inputUrl) {
                 "--disable-background-networking",
                 "--disable-extensions",
                 "--disable-sync",
+                "--disable-gpu",
+                "--no-zygote",
+                "--mute-audio",
+                "--no-first-run",
+                "--disable-speech-api",
                 ...(process.env.PUPPETEER_NO_SANDBOX === "true"
                     ? ["--no-sandbox", "--disable-setuid-sandbox"]
                     : []),
@@ -528,6 +537,15 @@ export async function scrapeWebsite(url) {
 
         console.log(
             `[Scraper] Static extraction unavailable; trying browser: ${url}`,
+        );
+    }
+
+    if (
+        process.env.ENABLE_PUPPETEER === "false" ||
+        process.env.DISABLE_PUPPETEER === "true"
+    ) {
+        throw new Error(
+            `Static extraction failed (${staticError.message}) and browser rendering is disabled.`
         );
     }
 
