@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createHash } from "node:crypto";
 
 const mocks = vi.hoisted(() => ({
-  scrapeReactWebsite: vi.fn(),
+  scrapeWebsite: vi.fn(),
   chunkText: vi.fn(),
   generateVectorEmbedding: vi.fn(),
   storeChunk: vi.fn(),
@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("./scraper.service.js", () => ({
-  scrapeReactWebsite: mocks.scrapeReactWebsite,
+  scrapeWebsite: mocks.scrapeWebsite,
 }));
 
 vi.mock("./chunking.service.js", () => ({
@@ -69,7 +69,7 @@ describe("crawlWebsite", () => {
     mocks.getPageCheckpoint.mockResolvedValue(null);
     mocks.getPageState.mockResolvedValue(null);
 
-    mocks.scrapeReactWebsite.mockResolvedValue({
+    mocks.scrapeWebsite.mockResolvedValue({
       head: defaultHead,
       body: defaultBody,
       internalLinks: [],
@@ -109,7 +109,7 @@ describe("crawlWebsite", () => {
 
     const result = await crawlWebsite(url, { jobId });
 
-    expect(mocks.scrapeReactWebsite).toHaveBeenCalledWith(url);
+    expect(mocks.scrapeWebsite).toHaveBeenCalledWith(url);
     expect(mocks.generateVectorEmbedding).toHaveBeenCalledTimes(3);
     expect(mocks.storeChunk).toHaveBeenCalledTimes(3);
 
@@ -160,7 +160,7 @@ describe("crawlWebsite", () => {
 
     const result = await crawlWebsite(url, { jobId });
 
-    expect(mocks.scrapeReactWebsite).toHaveBeenCalledOnce();
+    expect(mocks.scrapeWebsite).toHaveBeenCalledOnce();
     expect(mocks.generateVectorEmbedding).not.toHaveBeenCalled();
     expect(mocks.storeChunk).not.toHaveBeenCalled();
     expect(mocks.deleteChunks).not.toHaveBeenCalled();
@@ -246,7 +246,7 @@ describe("crawlWebsite", () => {
 
     const result = await crawlWebsite(url, { jobId });
 
-    expect(mocks.scrapeReactWebsite).not.toHaveBeenCalled();
+    expect(mocks.scrapeWebsite).not.toHaveBeenCalled();
     expect(mocks.storeChunk).not.toHaveBeenCalled();
     expect(mocks.getPageState).not.toHaveBeenCalled();
 
@@ -258,7 +258,7 @@ describe("crawlWebsite", () => {
   });
 
   it("crawls same-origin links but rejects external links", async () => {
-    mocks.scrapeReactWebsite
+    mocks.scrapeWebsite
       .mockResolvedValueOnce({
         head: defaultHead,
         body: defaultBody,
@@ -275,15 +275,15 @@ describe("crawlWebsite", () => {
 
     await crawlWebsite(url, { jobId });
 
-    expect(mocks.scrapeReactWebsite).toHaveBeenCalledTimes(2);
-    expect(mocks.scrapeReactWebsite).toHaveBeenCalledWith(
+    expect(mocks.scrapeWebsite).toHaveBeenCalledTimes(2);
+    expect(mocks.scrapeWebsite).toHaveBeenCalledWith(
       "https://example.com/"
     );
-    expect(mocks.scrapeReactWebsite).toHaveBeenCalledWith(
+    expect(mocks.scrapeWebsite).toHaveBeenCalledWith(
       "https://example.com/about"
     );
 
-    expect(mocks.scrapeReactWebsite).not.toHaveBeenCalledWith(
+    expect(mocks.scrapeWebsite).not.toHaveBeenCalledWith(
       "https://another-site.com/private"
     );
   });
@@ -297,7 +297,7 @@ describe("crawlWebsite", () => {
       crawlWebsite(url, { jobId })
     ).rejects.toThrow("Starting URL failed security validation");
 
-    expect(mocks.scrapeReactWebsite).not.toHaveBeenCalled();
+    expect(mocks.scrapeWebsite).not.toHaveBeenCalled();
   });
 
   it("requires a BullMQ job ID for checkpointing", async () => {

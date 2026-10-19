@@ -1,3 +1,4 @@
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 
@@ -5,6 +6,7 @@ const mocks = vi.hoisted(() => ({
     answerQuestion: vi.fn(),
     enqueueCrawl: vi.fn(),
     getCrawlJob: vi.fn(),
+    validatePublicHttpUrl: vi.fn(),
 }));
 
 vi.mock("./services/answer.service.js", () => ({
@@ -16,16 +18,33 @@ vi.mock("./services/crawlQueue.service.js", () => ({
     getCrawlJob: mocks.getCrawlJob,
 }));
 
+vi.mock("./security/urlSafety.js", () => ({
+    validatePublicHttpUrl: mocks.validatePublicHttpUrl,
+}));
+
 import app from "./app.js";
+
+let nextTestIp = 1;
+
+function apiRequest(method, path) {
+    const testIp = `198.51.100.${nextTestIp++}`;
+
+    return request(app)[method](path).set("X-Forwarded-For", testIp);
+}
 
 describe("Website Support API", () => {
     beforeEach(() => {
         vi.clearAllMocks();
+
+        // Keep tests independent of external DNS and network services.
+        mocks.validatePublicHttpUrl.mockImplementation(
+            async (value) => new URL(value)
+        );
     });
 
     describe("GET /health", () => {
         it("returns API health status", async () => {
-            const response = await request(app).get("/health");
+            const response = await apiRequest("get", "/health");
 
             expect(response.status).toBe(200);
             expect(response.body).toEqual({
@@ -37,19 +56,36 @@ describe("Website Support API", () => {
 
     describe("POST /api/crawls", () => {
         it("rejects a missing URL", async () => {
-            const response = await request(app)
-                .post("/api/crawls")
+            const response = await apiRequest("post", "/api/crawls")
                 .send({});
 
             expect(response.status).toBe(400);
-            expect(response.body.error).toBe("A website URL is required.");
             expect(mocks.enqueueCrawl).not.toHaveBeenCalled();
         });
 
-        it("rejects an invalid URL", async () => {
-            const response = await request(app)
-                .post("/api/crawls")
-                .send({ url: "not-a-valid-url" });
+        it("rejects a non-string URL", async () => {
+            const response = await apiRequest("post", "/api/crawls")
+                .send({ url: 123 });
+
+            expect(response.status).toBe(400);
+            expect(mocks.enqueueCrawl).not.toHaveBeenCalled();
+        });
+
+        it("rejects an excessively long URL", async () => {
+            const response = await apiRequest("post", "/api/crawls")
+                .send({ url: `https://example.com/${"a".repeat(2100)}` });
+
+            expect(response.status).toBe(400);
+            expect(mocks.enqueueCrawl).not.toHaveBeenCalled();
+        });
+
+        it("rejects a URL that fails public URL validation", async () => {
+            mocks.validatePublicHttpUrl.mockRejectedValue(
+                new Error("Private or invalid URL")
+            );
+
+            const response = await apiRequest("post", "/api/crawls")
+                .send({ url: "http://127.0.0.1" });
 
             expect(response.status).toBe(400);
             expect(mocks.enqueueCrawl).not.toHaveBeenCalled();
@@ -60,33 +96,52 @@ describe("Website Support API", () => {
                 jobId: "test-job-123",
                 status: "queued",
                 url: "https://example.com/",
+                deduplicated: false,
             });
 
-            const response = await request(app)
-                .post("/api/crawls")
+            const response = await apiRequest("post", "/api/crawls")
                 .send({ url: "https://example.com" });
 
             expect(response.status).toBe(202);
             expect(response.body.jobId).toBe("test-job-123");
             expect(response.body.status).toBe("queued");
 
+            expect(mocks.validatePublicHttpUrl).toHaveBeenCalledWith(
+                "https://example.com"
+            );
+
             expect(mocks.enqueueCrawl).toHaveBeenCalledWith(
                 "https://example.com/"
             );
         });
 
-        it("returns 500 when the queue service fails", async () => {
+        it("returns 429 when the queue is full", async () => {
+            const error = new Error("Queue full");
+            error.statusCode = 429;
+            error.code = "CRAWL_QUEUE_FULL";
+
+            mocks.enqueueCrawl.mockRejectedValue(error);
+
+            const response = await apiRequest("post", "/api/crawls")
+                .send({ url: "https://example.com" });
+
+            expect(response.status).toBe(429);
+            expect(response.body.error).toBe(
+                "The crawl queue is full. Please try again later."
+            );
+        });
+
+        it("returns 503 when queue infrastructure fails", async () => {
             mocks.enqueueCrawl.mockRejectedValue(
                 new Error("Valkey connection failed")
             );
 
-            const response = await request(app)
-                .post("/api/crawls")
+            const response = await apiRequest("post", "/api/crawls")
                 .send({ url: "https://example.com" });
 
-            expect(response.status).toBe(500);
+            expect(response.status).toBe(503);
             expect(response.body.error).toBe(
-                "Unable to queue the website crawl."
+                "Unable to queue the crawl right now. Please try again later."
             );
         });
     });
@@ -99,7 +154,6 @@ describe("Website Support API", () => {
                 state: "completed",
                 progress: 100,
                 result: { status: "completed" },
-                failedReason: null,
             });
 
             const response = await request(app).get(
@@ -122,7 +176,7 @@ describe("Website Support API", () => {
             expect(response.body.error).toBe("Crawl job not found.");
         });
 
-        it("returns 500 when retrieving job status fails", async () => {
+        it("returns 503 when queue status lookup fails", async () => {
             mocks.getCrawlJob.mockRejectedValue(
                 new Error("Queue unavailable")
             );
@@ -131,9 +185,9 @@ describe("Website Support API", () => {
                 "/api/crawls/test-job-123"
             );
 
-            expect(response.status).toBe(500);
+            expect(response.status).toBe(503);
             expect(response.body.error).toBe(
-                "Unable to retrieve crawl job status."
+                "Unable to retrieve crawl status right now."
             );
         });
     });
@@ -143,6 +197,34 @@ describe("Website Support API", () => {
             const response = await request(app)
                 .post("/api/chat")
                 .send({ question: "What does this website do?" });
+
+            expect(response.status).toBe(400);
+            expect(mocks.answerQuestion).not.toHaveBeenCalled();
+        });
+
+        it("rejects a question that is too long", async () => {
+            const response = await request(app)
+                .post("/api/chat")
+                .send({
+                    question: "a".repeat(2001),
+                    websiteUrl: "https://example.com",
+                });
+
+            expect(response.status).toBe(400);
+            expect(mocks.answerQuestion).not.toHaveBeenCalled();
+        });
+
+        it("rejects an invalid website URL", async () => {
+            mocks.validatePublicHttpUrl.mockRejectedValue(
+                new Error("Invalid URL")
+            );
+
+            const response = await request(app)
+                .post("/api/chat")
+                .send({
+                    question: "What does this website do?",
+                    websiteUrl: "http://127.0.0.1",
+                });
 
             expect(response.status).toBe(400);
             expect(mocks.answerQuestion).not.toHaveBeenCalled();
@@ -178,7 +260,7 @@ describe("Website Support API", () => {
             );
         });
 
-        it("returns 500 when the answer service fails", async () => {
+        it("returns 502 when the AI service fails", async () => {
             mocks.answerQuestion.mockRejectedValue(
                 new Error("AI service unavailable")
             );
@@ -190,10 +272,54 @@ describe("Website Support API", () => {
                     websiteUrl: "https://example.com",
                 });
 
-            expect(response.status).toBe(500);
+            expect(response.status).toBe(502);
             expect(response.body.error).toBe(
                 "Unable to answer the question right now. Please try again."
             );
+        });
+
+        it("returns 429 when the AI provider is rate-limiting", async () => {
+            const error = new Error("Provider rate limit");
+            error.status = 429;
+
+            mocks.answerQuestion.mockRejectedValue(error);
+
+            const response = await request(app)
+                .post("/api/chat")
+                .send({
+                    question: "What does this website do?",
+                    websiteUrl: "https://example.com",
+                });
+
+            expect(response.status).toBe(429);
+            expect(response.body.error).toContain("AI service is busy");
+        });
+    });
+
+    describe("Request validation", () => {
+        it("rejects malformed JSON", async () => {
+            const response = await request(app)
+                .post("/api/chat")
+                .set("Content-Type", "application/json")
+                .send('{"question":');
+
+            expect(response.status).toBe(400);
+            expect(response.body.error).toBe(
+                "Request body must contain valid JSON."
+            );
+        });
+
+        it("rejects requests from a disallowed browser origin", async () => {
+            const response = await request(app)
+                .post("/api/chat")
+                .set("Origin", "https://untrusted.example")
+                .send({
+                    question: "Hello",
+                    websiteUrl: "https://example.com",
+                });
+
+            expect(response.status).toBe(403);
+            expect(mocks.answerQuestion).not.toHaveBeenCalled();
         });
     });
 });

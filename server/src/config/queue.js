@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
@@ -8,17 +7,28 @@ const redisUrl =
 
 export const redisConnection = new IORedis(redisUrl, {
   maxRetriesPerRequest: null,
+  enableReadyCheck: true,
+  connectTimeout: 10_000,
 });
 
 export const crawlQueue = new Queue("website-support-crawl", {
   connection: redisConnection,
+
   defaultJobOptions: {
     attempts: 3,
+
     backoff: {
       type: "exponential",
-      delay: 2000,
+      delay: 2_000,
     },
-    removeOnComplete: 100,
-    removeOnFail: 200,
+
+    // Keep bounded history for debugging without unlimited Redis growth.
+    removeOnComplete: {
+      count: 100,
+    },
+
+    removeOnFail: {
+      count: 200,
+    },
   },
 });

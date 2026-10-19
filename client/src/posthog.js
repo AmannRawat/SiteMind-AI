@@ -1,4 +1,3 @@
-
 import posthog from "posthog-js";
 
 const posthogKey = import.meta.env.VITE_POSTHOG_KEY;
