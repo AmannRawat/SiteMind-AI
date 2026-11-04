@@ -12,7 +12,8 @@ const MAX_REDIRECTS = 5;
 // Browser limits
 const BROWSER_TIMEOUT_MS = 15_000;
 const BROWSER_OPERATION_TIMEOUT_MS = 18_000;
-const BROWSER_CLOSE_TIMEOUT_MS = 2_000;
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+const BROWSER_HYDRATION_TIMEOUT_MS = 5_000;
 
 // Resource limits
 const MIN_USEFUL_TEXT_LENGTH = 200;
@@ -186,11 +187,31 @@ function extractHtmlContent(html, baseUrl) {
     };
 }
 
-function hasUsefulContent(result) {
+function isErrorPageContent(result) {
+    const head = String(result?.head || "");
+    const body = String(result?.body || "");
+    const combined = `${head} ${body}`.slice(0, 1500);
+
     return (
-        typeof result?.body === "string" &&
-        result.body.trim().length >= MIN_USEFUL_TEXT_LENGTH
+        /404\s*:\s*not_found|404\s+not_found|this page doesn’t exist.*it may have been moved/i.test(combined) ||
+        /<title>404:\s*not_found<\/title>/i.test(combined)
     );
+}
+
+function hasUsefulContent(result) {
+    if (!result || typeof result.body !== "string") {
+        return false;
+    }
+
+    if (result.body.trim().length < MIN_USEFUL_TEXT_LENGTH) {
+        return false;
+    }
+
+    if (isErrorPageContent(result)) {
+        return false;
+    }
+
+    return true;
 }
 
 function isHtmlResponse(contentType = "") {
@@ -293,9 +314,9 @@ function closeBrowserSafely(browser) {
 
                 if (child && child.pid && child.exitCode === null) {
                     try {
-                        process.kill(-child.pid, "SIGKILL");
-                    } catch {
                         child.kill("SIGKILL");
+                    } catch {
+                        // The process may already have exited.
                     }
                 }
             } catch {
@@ -386,7 +407,34 @@ export async function scrapeReactWebsite(inputUrl) {
                 page.setDefaultNavigationTimeout(BROWSER_TIMEOUT_MS);
                 page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
 
+                if (typeof page.setUserAgent === "function") {
+                    await page.setUserAgent(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 SiteMindAI/1.0",
+                    );
+                }
+
                 await page.setRequestInterception(true);
+
+                const validatedHostnames = new Set([new URL(url).hostname.toLowerCase()]);
+                const pendingValidations = new Map();
+
+                async function ensureHostSafe(reqHostname, requestUrl) {
+                    if (validatedHostnames.has(reqHostname)) return true;
+                    if (pendingValidations.has(reqHostname)) {
+                        return pendingValidations.get(reqHostname);
+                    }
+                    const validationPromise = (async () => {
+                        try {
+                            await validatePublicHttpUrl(requestUrl);
+                            validatedHostnames.add(reqHostname);
+                            return true;
+                        } finally {
+                            pendingValidations.delete(reqHostname);
+                        }
+                    })();
+                    pendingValidations.set(reqHostname, validationPromise);
+                    return validationPromise;
+                }
 
                 page.on("request", (request) => {
                     void (async () => {
@@ -394,7 +442,8 @@ export async function scrapeReactWebsite(inputUrl) {
                             if (request.isInterceptResolutionHandled()) return;
 
                             const requestUrl = request.url();
-                            const protocol = new URL(requestUrl).protocol;
+                            const parsedRequestUrl = new URL(requestUrl);
+                            const protocol = parsedRequestUrl.protocol;
 
                             if (["data:", "blob:", "about:"].includes(protocol)) {
                                 await request.continue();
@@ -413,7 +462,9 @@ export async function scrapeReactWebsite(inputUrl) {
 
                             // Validate HTTP(S) destinations before allowing
                             // navigation and subresource requests.
-                            await validateUrl(requestUrl);
+                            // Cache validated hostnames to avoid redundant DNS lookups for subresources.
+                            const reqHostname = parsedRequestUrl.hostname.toLowerCase();
+                            await ensureHostSafe(reqHostname, requestUrl);
 
                             if (!request.isInterceptResolutionHandled()) {
                                 await request.continue();
@@ -435,13 +486,65 @@ export async function scrapeReactWebsite(inputUrl) {
                     timeout: BROWSER_TIMEOUT_MS,
                 });
 
-                const result = await page.evaluate(() => ({
-                    head: document.head?.innerText || "",
-                    body: document.body?.innerText || "",
-                    links: Array.from(
-                        document.querySelectorAll("a[href]"),
-                    ).map((anchor) => anchor.href),
-                }));
+                // Wait for client-side JavaScript / SPA hydration (React, Vue, Vite, etc.)
+                // to render readable content into the DOM before extracting.
+                // Do not accept a merely non-empty root/loading splash as proof of completion.
+                if (typeof page.waitForFunction === "function") {
+                    try {
+                        await page.waitForFunction(
+                            (minUsefulLength) => {
+                                const bodyText = document.body?.innerText?.trim() || "";
+
+                                // Ignore temporary loading splash screens (e.g. "Loading...", "Loading PrepAI...")
+                                const isTemporaryLoadingScreen =
+                                    /^\s*loading\b/i.test(bodyText) && bodyText.length < 100;
+
+                                if (isTemporaryLoadingScreen) {
+                                    return false;
+                                }
+
+                                // Primary readiness threshold: body text reaches minimum useful text length
+                                if (bodyText.length >= minUsefulLength) {
+                                    return true;
+                                }
+
+                                // Alternative check: substantive structured content mounted inside main content containers
+                                const mainContainer = document.querySelector("main, article, [role='main']");
+                                if (mainContainer && (mainContainer.innerText?.trim()?.length || 0) >= minUsefulLength) {
+                                    return true;
+                                }
+
+                                return false;
+                            },
+                            { timeout: BROWSER_HYDRATION_TIMEOUT_MS },
+                            MIN_USEFUL_TEXT_LENGTH,
+                        );
+                    } catch {
+                        // Hydration wait timed out or threshold was not met before timeout;
+                        // fall through to final DOM extraction and let hasUsefulContent decide whether to fail.
+                    }
+                }
+
+                const result = await page.evaluate(() => {
+                    const title = document.title || "";
+                    const metaDescription =
+                        document
+                            .querySelector(
+                                'meta[name="description"], meta[property="og:description"]',
+                            )
+                            ?.getAttribute("content") || "";
+
+                    const headParts = [title, metaDescription].filter(Boolean);
+                    const head = headParts.join(" - ") || document.head?.innerText || "";
+
+                    return {
+                        head,
+                        body: document.body?.innerText || "",
+                        links: Array.from(
+                            document.querySelectorAll("a[href]"),
+                        ).map((anchor) => anchor.href),
+                    };
+                });
 
                 const internalLinks = new Set();
                 const externalLinks = new Set();

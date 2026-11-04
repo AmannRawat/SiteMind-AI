@@ -71,6 +71,15 @@ export async function ensureCollection() {
         { wait: true }
       );
 
+      await qdrantClient.createPayloadIndex(
+        QDRANT_COLLECTION,
+        {
+          field_name: "url",
+          field_schema: "keyword",
+        },
+        { wait: true }
+      );
+
       return QDRANT_COLLECTION;
     })().catch((error) => {
       collectionPromise = undefined;

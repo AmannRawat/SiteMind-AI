@@ -91,3 +91,11 @@ export async function savePageCheckpoint(jobId, pageUrl, data) {
     CHECKPOINT_TTL_SECONDS
   );
 }
+
+export async function closeCheckpointClient() {
+  try {
+    await redis.quit();
+  } catch (error) {
+    console.error("[Checkpoint] Error closing Redis client:", error.message);
+  }
+}

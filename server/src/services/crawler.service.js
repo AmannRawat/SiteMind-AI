@@ -23,6 +23,7 @@ const MAX_ALLOWED_PAGES = 50;
 const MAX_ALLOWED_DEPTH = 4;
 const MIN_CRAWL_TIMEOUT_MS = 5_000;
 const MAX_CRAWL_TIMEOUT_MS = 120_000;
+const MAX_QUEUED_URLS = 200;
 
 class CrawlDeadlineError extends Error {
     constructor() {
@@ -245,7 +246,11 @@ export async function crawlWebsite(startUrl, options = {}) {
                     }
 
                     if (new URL(nextUrl).origin === allowedOrigin) {
-                        if (!visited.has(nextUrl) && !queued.has(nextUrl)) {
+                        if (
+                            !visited.has(nextUrl) &&
+                            !queued.has(nextUrl) &&
+                            queue.length < MAX_QUEUED_URLS
+                        ) {
                             queued.add(nextUrl);
                             queue.push({ url: nextUrl, depth: depth + 1 });
                         }
@@ -287,6 +292,12 @@ export async function crawlWebsite(startUrl, options = {}) {
             const internalLinks = Array.isArray(scraped.internalLinks)
                 ? scraped.internalLinks
                 : [];
+
+            console.log("\n--- [Diagnostic] Crawler Received Extracted Content ---");
+            console.log(`URL: ${normalizedUrl}`);
+            console.log(`Head text length: ${head.length}`);
+            console.log(`Body text length: ${body.length}`);
+            console.log(`Internal links count: ${internalLinks.length}`);
 
             // Do not embed pages that contain no useful text.
             if (!head.trim() && !body.trim()) {
@@ -485,17 +496,14 @@ export async function crawlWebsite(startUrl, options = {}) {
         );
     }
 
-    const vectorCount = await getVectorCount();
+    const vectorCount = await getVectorCount(allowedOrigin);
 
-    const status = timedOut
-        ? processedPages > 0
-            ? "partial"
-            : "failed"
-        : failedPages === 0
-            ? "completed"
-            : processedPages > 0
+    const status =
+        processedPages === 0
+            ? "failed"
+            : timedOut || failedPages > 0
                 ? "partial"
-                : "failed";
+                : "completed";
 
     return {
         websiteUrl: start,

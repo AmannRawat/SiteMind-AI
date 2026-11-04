@@ -18,6 +18,7 @@ import {
 
 import { Analytics } from '@vercel/analytics/react';
 import posthog from "./posthog.js";
+import { MarkdownContent } from "./components/MarkdownContent.jsx";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000";
 
@@ -33,10 +34,30 @@ export default function App() {
   const [chatLoading, setChatLoading] = useState(false);
 
   const state = job?.state || job?.status;
-  const crawlResultStatus = job?.result?.status;
+  const isDelayed = state === "delayed" || Boolean(job?.isDelayed);
+  const isDeduplicated = Boolean(job?.deduplicated || job?.isExistingJob);
+  const crawlResult = job?.result;
+  const crawlResultStatus = crawlResult?.status;
+  const processedPages = Number(crawlResult?.processedPages ?? 0);
+  const indexedChunks = Number(crawlResult?.indexedChunks ?? 0);
 
-  const completed = state === "completed";
-  const failed = state === "failed";
+  // A crawl is genuinely failed if:
+  // 1) BullMQ reports failed state, OR
+  // 2) The crawler explicitly marked status as "failed", OR
+  // 3) The state is reported "completed" but 0 pages and 0 chunks were indexed.
+  const failed =
+    state === "failed" ||
+    crawlResultStatus === "failed" ||
+    (state === "completed" && processedPages === 0 && indexedChunks === 0);
+
+  // A crawl is completed only when it reached completion and indexed actual content.
+  const completed =
+    state === "completed" &&
+    !failed &&
+    (job?.isSuccess !== undefined
+      ? Boolean(job.isSuccess)
+      : processedPages > 0 || indexedChunks > 0);
+
   const partiallyCompleted = completed && crawlResultStatus === "partial";
   const active = Boolean(job && !completed && !failed);
   const websiteUrl = job?.url || job?.result?.websiteUrl || "";
@@ -92,7 +113,7 @@ export default function App() {
           setError("");
 
           setJob((current) =>
-            current?.jobId === data.jobId ? data : current
+            current?.jobId === data.jobId ? { ...current, ...data } : current
           );
         }
       } catch (err) {
@@ -241,26 +262,14 @@ export default function App() {
       <header className="sticky top-0 z-30 border-b border-[#292929] bg-[#090909]/95 backdrop-blur-md">
         <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3.5 sm:px-6">
           <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#292929] bg-[#141414] text-[#FF2A2A]">
-              {/* SiteMind AI Brand Icon */}
-              <svg
-                width="20"
-                height="20"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="shrink-0"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="3" fill="#FF2A2A" stroke="none" />
-                <path d="M12 3v3m0 12v3M3 12h3m12 0h3" />
-                <path d="M5.636 5.636l2.122 2.122m8.484 8.484l2.122 2.122" />
-                <path d="M18.364 5.636l-2.122 2.122m-8.484 8.484l-2.122 2.122" />
-              </svg>
-            </div>
+            {/* SiteMind AI Brand Favicon Logo */}
+            <img
+              src="/favicon.svg"
+              alt="SiteMind AI Logo"
+              className="h-9 w-9 rounded-lg shrink-0"
+              width="36"
+              height="36"
+            />
 
             <div>
               <div className="flex items-center gap-2">
@@ -394,9 +403,16 @@ export default function App() {
           >
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0">
-                <h2 id="crawl-status-heading" className="text-sm font-semibold text-[#F5F5F5]">
-                  Crawl job
-                </h2>
+                <div className="flex items-center gap-2">
+                  <h2 id="crawl-status-heading" className="text-sm font-semibold text-[#F5F5F5]">
+                    Crawl job
+                  </h2>
+                  {isDeduplicated && (
+                    <span className="rounded border border-[#3B82F6]/30 bg-[#3B82F6]/10 px-1.5 py-0.5 text-[10px] font-medium text-[#60A5FA]">
+                      Existing active job
+                    </span>
+                  )}
+                </div>
                 <p className="mt-0.5 break-all font-mono text-xs text-[#737373]">
                   ID: {job.jobId}
                 </p>
@@ -417,6 +433,11 @@ export default function App() {
                   <CheckCircle2 size={14} className="shrink-0" aria-hidden="true" />
                   Completed
                 </span>
+              ) : isDelayed ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-[#EAB308]/30 bg-[#EAB308]/10 px-2.5 py-1 text-xs font-medium text-[#FACC15]">
+                  <Clock3 size={14} className="shrink-0 animate-pulse" aria-hidden="true" />
+                  Retrying
+                </span>
               ) : (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-[#FF2A2A]/30 bg-[#FF2A2A]/10 px-2.5 py-1 text-xs font-medium text-[#FF2A2A]">
                   <LoaderCircle size={14} className="shrink-0 animate-spin" aria-hidden="true" />
@@ -430,7 +451,11 @@ export default function App() {
               <div className="flex items-center gap-1.5">
                 <Clock3 size={14} className="text-[#737373]" aria-hidden="true" />
                 <span className="capitalize">
-                  {partiallyCompleted ? "Partially completed" : state || "waiting"}
+                  {partiallyCompleted
+                    ? "Partially completed"
+                    : isDelayed
+                      ? "Waiting to retry (delayed)"
+                      : state || "waiting"}
                 </span>
               </div>
               <span className="font-mono text-xs text-[#737373]">
@@ -449,7 +474,7 @@ export default function App() {
               <div
                 className={`h-full rounded-full transition-all duration-300 ease-out ${failed
                   ? "bg-[#EF4444]"
-                  : partiallyCompleted
+                  : partiallyCompleted || isDelayed
                     ? "bg-[#EAB308]"
                     : completed
                       ? "bg-[#22C55E]"
@@ -464,10 +489,23 @@ export default function App() {
               />
             </div>
 
+            {/* Informative banner for deduplicated/existing job */}
+            {isDeduplicated && active && (
+              <div className="mt-3 flex items-center gap-2 rounded-lg border border-[#3B82F6]/20 bg-[#3B82F6]/10 p-2.5 text-xs text-[#93C5FD]">
+                <Clock3 size={14} className="shrink-0" aria-hidden="true" />
+                <span>
+                  Attached to an existing in-progress crawl for this URL. Monitoring live status.
+                </span>
+              </div>
+            )}
+
             {/* Error detail */}
             {failed && (
               <p className="mt-3 rounded-lg border border-[#EF4444]/20 bg-[#EF4444]/10 p-3 text-xs leading-relaxed text-[#FCA5A5] break-words">
-                {job.failedReason || "The crawl failed. Please check worker logs or verify the URL is reachable."}
+                {job.failedReason ||
+                  (processedPages === 0 && indexedChunks === 0
+                    ? "Crawl failed: no readable content was found or indexed for this website."
+                    : "The crawl failed. Please check worker logs or verify the URL is reachable.")}
               </p>
             )}
 
@@ -599,9 +637,13 @@ export default function App() {
                       : "border border-[#292929] bg-[#1C1C1C] text-[#F5F5F5]"
                       }`}
                   >
-                    <div className="whitespace-pre-wrap break-words leading-relaxed text-sm">
-                      {message.text}
-                    </div>
+                    {message.role === "assistant" ? (
+                      <MarkdownContent content={message.text} />
+                    ) : (
+                      <div className="whitespace-pre-wrap break-words leading-relaxed text-sm">
+                        {message.text}
+                      </div>
+                    )}
 
                     {message.role === "assistant" && message.sources?.length > 0 && (
                       <div className="mt-3 border-t border-[#292929] pt-2.5">

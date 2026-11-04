@@ -2,6 +2,7 @@ import "dotenv/config";
 import { Worker } from "bullmq";
 import IORedis from "ioredis";
 import { processCrawlJob } from "./services/crawlJobProcessor.js";
+import { closeCheckpointClient } from "./services/crawlCheckpoint.service.js";
 
 const connection = new IORedis(
   process.env.VALKEY_URL || "redis://127.0.0.1:6380",
@@ -69,6 +70,7 @@ export async function closeWorker() {
   try {
     await worker.close();
     await connection.quit();
+    await closeCheckpointClient();
   } catch (error) {
     console.error("[Worker] Error closing worker/connection:", error.message);
     throw error;
@@ -101,4 +103,4 @@ if (isMainModule) {
   process.once("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-export { worker, connection };
+export { worker, connection };

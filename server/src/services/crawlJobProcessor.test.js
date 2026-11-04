@@ -1,5 +1,6 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { UnrecoverableError } from "bullmq";
 
 const { crawlWebsite } = vi.hoisted(() => ({
   crawlWebsite: vi.fn(),
@@ -74,7 +75,7 @@ describe("processCrawlJob", () => {
     expect(job.updateProgress).toHaveBeenNthCalledWith(2, 100);
   });
 
-  it("throws when the crawl result is failed", async () => {
+  it("throws UnrecoverableError when the crawl result is failed", async () => {
     crawlWebsite.mockResolvedValue({
       status: "failed",
       processedPages: 0,
@@ -85,17 +86,26 @@ describe("processCrawlJob", () => {
     await expect(processCrawlJob(job)).rejects.toThrow(
       "Crawl failed: no pages were processed successfully for https://example.com/"
     );
+    await expect(processCrawlJob(job)).rejects.toBeInstanceOf(UnrecoverableError);
 
-    expect(job.updateProgress).toHaveBeenCalledTimes(1);
+    expect(job.updateProgress).toHaveBeenCalledTimes(2);
     expect(job.updateProgress).toHaveBeenCalledWith(5);
   });
 
-  it("propagates infrastructure errors so BullMQ can retry", async () => {
-    crawlWebsite.mockRejectedValue(new Error("Qdrant unavailable"));
-
-    await expect(processCrawlJob(job)).rejects.toThrow(
-      "Qdrant unavailable"
+  it("throws UnrecoverableError when the starting URL fails security validation", async () => {
+    crawlWebsite.mockRejectedValue(
+      new Error("Starting URL failed security validation: Private network not allowed")
     );
+
+    await expect(processCrawlJob(job)).rejects.toBeInstanceOf(UnrecoverableError);
+  });
+
+  it("propagates infrastructure errors as retryable errors", async () => {
+    const error = new Error("Qdrant unavailable");
+    crawlWebsite.mockRejectedValue(error);
+
+    await expect(processCrawlJob(job)).rejects.toThrow("Qdrant unavailable");
+    await expect(processCrawlJob(job)).rejects.not.toBeInstanceOf(UnrecoverableError);
   });
 
   it("propagates progress callback errors", async () => {

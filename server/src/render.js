@@ -2,6 +2,7 @@ import "dotenv/config";
 import app from "./app.js";
 import { crawlQueue, redisConnection } from "./config/queue.js";
 import { closeWorker } from "./worker.js";
+import { closeCheckpointClient } from "./services/crawlCheckpoint.service.js";
 
 const PORT = Number(process.env.PORT) || 4000;
 
@@ -24,6 +25,7 @@ async function shutdown(signal) {
       await closeWorker();
       await crawlQueue.close();
       await redisConnection.quit();
+      await closeCheckpointClient();
       console.log("[Render] Unified shutdown complete.");
       process.exit(0);
     } catch (error) {

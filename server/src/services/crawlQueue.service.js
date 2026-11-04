@@ -23,6 +23,8 @@ function normalizeCrawlUrl(value) {
 export async function enqueueCrawl(inputUrl) {
   const url = normalizeCrawlUrl(inputUrl);
 
+  console.log(`[Diagnostic] Enqueue request - Submitted: "${inputUrl}", Normalized: "${url}"`);
+
   // First avoid enqueuing the same URL repeatedly while an existing
   // crawl is waiting, running, or delayed for a retry.
   const existingJobs = await crawlQueue.getJobs(
@@ -38,11 +40,18 @@ export async function enqueueCrawl(inputUrl) {
     const state = await existingJob.getState();
 
     if (ACTIVE_STATES.has(state)) {
+      console.log(
+        `[Diagnostic] Deduplication HIT - existingJobId: ${existingJob.id}, state: ${state}, url: "${url}"`
+      );
+      const isDelayed = state === "delayed";
       return {
         jobId: existingJob.id,
-        status: state === "active" ? "active" : "queued",
+        status: isDelayed ? "delayed" : state === "active" ? "active" : "queued",
+        state,
         url,
         deduplicated: true,
+        isExistingJob: true,
+        isDelayed,
       };
     }
   }
@@ -79,11 +88,18 @@ export async function enqueueCrawl(inputUrl) {
     }
   );
 
+  console.log(
+    `[Diagnostic] New job created - jobId: ${job.id}, state: queued, url: "${url}", deduplicated: false`
+  );
+
   return {
     jobId: job.id,
     status: "queued",
+    state: "waiting",
     url,
     deduplicated: false,
+    isExistingJob: false,
+    isDelayed: false,
   };
 }
 
@@ -99,14 +115,49 @@ export async function getCrawlJob(jobId) {
   }
 
   const state = await job.getState();
+  const result = job.returnvalue ?? null;
+  const processedPages = Number(result?.processedPages ?? 0);
+  const indexedChunks = Number(result?.indexedChunks ?? 0);
+  const isCrawlResultFailed = result?.status === "failed";
 
-  // Do not return failedReason, stack traces, or internal error details
-  // through a public endpoint.
+  // Return only sanitized, safe user-facing failure messages;
+  // never leak internal error details or stack traces through a public endpoint.
+  let failedReason = null;
+  if (
+    state === "failed" ||
+    isCrawlResultFailed ||
+    (state === "completed" && processedPages === 0 && indexedChunks === 0)
+  ) {
+    if (
+      typeof job.failedReason === "string" &&
+      job.failedReason.startsWith("Crawl failed:")
+    ) {
+      failedReason = job.failedReason;
+    } else if (state === "completed" && processedPages === 0) {
+      failedReason = "Crawl failed: no pages were processed or indexed.";
+    } else {
+      failedReason =
+        "The crawl failed. Please check worker logs or verify the URL is reachable.";
+    }
+  }
+
+  const isSuccess =
+    state === "completed" &&
+    !isCrawlResultFailed &&
+    (processedPages > 0 || indexedChunks > 0);
+
+  console.log(
+    `[Diagnostic] Job poll - jobId: ${job.id}, state: ${state}, progress: ${job.progress}, isSuccess: ${isSuccess}, status: ${result?.status ?? "none"}`
+  );
+
   return {
     jobId: job.id,
     url: job.data?.url ?? null,
     state,
     progress: job.progress,
-    result: job.returnvalue ?? null,
+    failedReason,
+    result,
+    isSuccess,
+    isDelayed: state === "delayed",
   };
 }

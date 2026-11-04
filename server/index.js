@@ -8,7 +8,9 @@ const START_URL = "https://anupbh77.github.io/";
 async function main() {
     console.log("🚀 Starting ingestion...\n");
 
-    const result = await crawlWebsite(START_URL);
+    const result = await crawlWebsite(START_URL, {
+        jobId: "cli-local-ingestion",
+    });
 
     console.log("\n📊 Indexing summary");
     console.log("-------------------");

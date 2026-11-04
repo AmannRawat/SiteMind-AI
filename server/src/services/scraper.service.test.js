@@ -10,7 +10,9 @@ const mocks = vi.hoisted(() => ({
     setRequestInterception: vi.fn(),
     setDefaultNavigationTimeout: vi.fn(),
     setDefaultTimeout: vi.fn(),
+    setUserAgent: vi.fn(),
     goto: vi.fn(),
+    waitForFunction: vi.fn(),
     evaluate: vi.fn(),
     setRequestHandler: vi.fn(),
 }));
@@ -60,8 +62,10 @@ function mockBrowser({
         setDefaultNavigationTimeout: mocks.setDefaultNavigationTimeout,
         setDefaultTimeout: mocks.setDefaultTimeout,
         setRequestInterception: mocks.setRequestInterception,
+        setUserAgent: mocks.setUserAgent,
         on: mocks.setRequestHandler,
         goto: mocks.goto,
+        waitForFunction: mocks.waitForFunction,
         evaluate: mocks.evaluate,
         close: mocks.pageClose,
     };
@@ -76,7 +80,9 @@ function mockBrowser({
     mocks.pageClose.mockResolvedValue(undefined);
     mocks.browserClose.mockResolvedValue(undefined);
     mocks.setRequestInterception.mockResolvedValue(undefined);
+    mocks.setUserAgent.mockResolvedValue(undefined);
     mocks.goto.mockResolvedValue(undefined);
+    mocks.waitForFunction.mockResolvedValue(undefined);
     mocks.evaluate.mockResolvedValue({
         head: "Example website",
         body,
@@ -200,6 +206,78 @@ describe("scrapeReactWebsite", () => {
 
         expect(mocks.pageClose).toHaveBeenCalledOnce();
         expect(mocks.browserClose).toHaveBeenCalledOnce();
+    });
+
+    it("waits for SPA hydration before extracting content", async () => {
+        mockBrowser();
+
+        await scrapeReactWebsite(URL);
+
+        expect(mocks.waitForFunction).toHaveBeenCalledWith(
+            expect.any(Function),
+            expect.objectContaining({
+                timeout: expect.any(Number),
+            }),
+            expect.any(Number),
+        );
+
+        const [predicate, , minUsefulLength] = mocks.waitForFunction.mock.calls[0];
+        expect(minUsefulLength).toBe(200);
+
+        // Test hydration predicate logic against simulated DOM states
+        const originalDocument = globalThis.document;
+        try {
+            // Case 1: Temporary loading splash screen should be rejected
+            globalThis.document = {
+                body: { innerText: "Loading PrepAI..." },
+                querySelector: () => null,
+            };
+            expect(predicate(200)).toBe(false);
+
+            globalThis.document = {
+                body: { innerText: "Loading..." },
+                querySelector: () => null,
+            };
+            expect(predicate(200)).toBe(false);
+
+            // Case 2: Insufficient text length without loading prefix should be rejected
+            globalThis.document = {
+                body: { innerText: "Not ready yet" },
+                querySelector: () => null,
+            };
+            expect(predicate(200)).toBe(false);
+
+            // Case 3: Meaningful body text reaching threshold should be accepted
+            globalThis.document = {
+                body: { innerText: "Meaningful hydrated content. ".repeat(15) },
+                querySelector: () => null,
+            };
+            expect(predicate(200)).toBe(true);
+
+            // Case 4: Substantive content mounted inside semantic main container should be accepted
+            globalThis.document = {
+                body: { innerText: "" },
+                querySelector: (selector) =>
+                    selector.includes("main")
+                        ? { innerText: "Substantive main section text. ".repeat(10) }
+                        : null,
+            };
+            expect(predicate(200)).toBe(true);
+        } finally {
+            globalThis.document = originalDocument;
+        }
+    });
+
+    it("continues and evaluates DOM if hydration wait times out", async () => {
+        mockBrowser();
+        mocks.waitForFunction.mockRejectedValue(
+            new Error("Waiting for function failed: timeout 5000ms exceeded"),
+        );
+
+        const result = await scrapeReactWebsite(URL);
+
+        expect(result.body).toContain("Rendered website content");
+        expect(mocks.evaluate).toHaveBeenCalledOnce();
     });
 
     it("closes the page and browser when navigation fails", async () => {

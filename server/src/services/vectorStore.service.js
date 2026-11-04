@@ -67,21 +67,81 @@ export async function storeChunk({
   });
 }
 
+function isErrorChunk(text) {
+  if (!text || typeof text !== "string") return true;
+  return (
+    /404\s*:\s*not_found|404\s+not_found|this page doesn’t exist/i.test(text) ||
+    /<title>404:\s*not_found<\/title>/i.test(text)
+  );
+}
+
+export async function getHomepageChunk(websiteUrl) {
+  if (!websiteUrl) return null;
+  await ensureCollection();
+
+  const origin = new URL(websiteUrl).origin;
+  const candidates = [origin, `${origin}/`];
+
+  for (const urlCandidate of candidates) {
+    try {
+      const scrollResult = await qdrantClient.scroll(QDRANT_COLLECTION, {
+        filter: {
+          must: [
+            { key: "websiteUrl", match: { value: origin } },
+            { key: "url", match: { value: urlCandidate } },
+          ],
+        },
+        limit: 10,
+        with_payload: true,
+      });
+
+      const validPoints = (scrollResult.points || []).filter(
+        (p) =>
+          typeof p.payload?.text === "string" &&
+          p.payload.text.trim().length >= 100 &&
+          !isErrorChunk(p.payload.text)
+      );
+
+      if (validPoints.length > 0) {
+        // Sort by text length to pick the main content body chunk rather than title
+        validPoints.sort(
+          (a, b) => (b.payload?.text?.length || 0) - (a.payload?.text?.length || 0)
+        );
+
+        return {
+          text: validPoints[0].payload.text,
+          url: validPoints[0].payload.url || urlCandidate,
+          title: validPoints[0].payload.title || "",
+        };
+      }
+    } catch {
+      // Fallback if payload index is still building or scroll fails
+    }
+  }
+
+  return null;
+}
+
 export async function retrieveChunks(
   questionEmbedding,
   websiteUrl,
-  limit = 3
+  limit = 6
 ) {
   await ensureCollection();
 
+  const normalizedOrigin = new URL(websiteUrl).origin;
+
+  // Over-fetch to ensure filtering out empty/error chunks does not deplete the limit
+  const fetchLimit = Math.max(limit * 2, 10);
+
   const result = await qdrantClient.query(QDRANT_COLLECTION, {
     query: questionEmbedding,
-    limit,
+    limit: fetchLimit,
     filter: {
       must: [
         {
           key: "websiteUrl",
-          match: { value: websiteUrl },
+          match: { value: normalizedOrigin },
         },
       ],
     },
@@ -89,8 +149,11 @@ export async function retrieveChunks(
     with_vector: false,
   });
 
-  // Preserve the response shape expected by answer.service.js.
-  const points = result.points || [];
+  // Preserve the response shape expected by answer.service.js,
+  // filtering out any error or 404 pages.
+  const points = (result.points || [])
+    .filter((point) => !isErrorChunk(point.payload?.text))
+    .slice(0, limit);
 
   return {
     documents: [
@@ -101,17 +164,28 @@ export async function retrieveChunks(
         url: point.payload?.url || "",
         websiteUrl: point.payload?.websiteUrl || "",
         title: point.payload?.title || "",
+        score: point.score,
       })),
     ],
   };
 }
 
-export async function getVectorCount() {
+export async function getVectorCount(websiteUrl) {
   await ensureCollection();
 
-  const result = await qdrantClient.count(QDRANT_COLLECTION, {
-    exact: true,
-  });
+  const countOptions = { exact: true };
+  if (websiteUrl) {
+    countOptions.filter = {
+      must: [
+        {
+          key: "websiteUrl",
+          match: { value: websiteUrl },
+        },
+      ],
+    };
+  }
+
+  const result = await qdrantClient.count(QDRANT_COLLECTION, countOptions);
 
   return result.count;
 }
@@ -127,4 +201,39 @@ export async function deleteChunks(ids) {
     wait: true,
     points: pointIds,
   });
+}
+
+export async function deleteChunksByUrl(url, keepChunkIds = []) {
+  if (!url) return;
+  await ensureCollection();
+
+  const keepSet = new Set(keepChunkIds.map(toPointId));
+
+  try {
+    const scrollResult = await qdrantClient.scroll(QDRANT_COLLECTION, {
+      filter: {
+        must: [
+          {
+            key: "url",
+            match: { value: url },
+          },
+        ],
+      },
+      limit: 100,
+      with_payload: false,
+    });
+
+    const stalePointIds = (scrollResult.points || [])
+      .map((p) => p.id)
+      .filter((id) => !keepSet.has(id));
+
+    if (stalePointIds.length > 0) {
+      await qdrantClient.delete(QDRANT_COLLECTION, {
+        wait: true,
+        points: stalePointIds,
+      });
+    }
+  } catch (error) {
+    console.warn(`[VectorStore] Failed to purge stale chunks for ${url}:`, error.message);
+  }
 }

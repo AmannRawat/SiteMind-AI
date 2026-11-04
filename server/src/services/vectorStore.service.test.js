@@ -108,7 +108,7 @@ describe("vectorStore.service", () => {
       "website_support_chunks",
       expect.objectContaining({
         query: embedding,
-        limit: 3,
+        limit: 10,
         filter: {
           must: [
             {
@@ -133,14 +133,47 @@ describe("vectorStore.service", () => {
     });
   });
 
-  it("supports a custom result limit", async () => {
-    await retrieveChunks(
+  it("filters out error chunks and respects the requested limit", async () => {
+    qdrantClient.query.mockResolvedValue({
+      points: [
+        {
+          id: "00000000-0000-5000-8000-000000000001",
+          payload: {
+            text: "404: NOT_FOUND This page could not be found.",
+            url: "https://example.com/broken",
+            websiteUrl: "https://example.com",
+            title: "404",
+          },
+        },
+        {
+          id: "00000000-0000-5000-8000-000000000002",
+          payload: {
+            text: "Valid content chunk 1",
+            url: "https://example.com/feature1",
+            websiteUrl: "https://example.com",
+            title: "Feature 1",
+          },
+        },
+        {
+          id: "00000000-0000-5000-8000-000000000003",
+          payload: {
+            text: "Valid content chunk 2",
+            url: "https://example.com/feature2",
+            websiteUrl: "https://example.com",
+            title: "Feature 2",
+          },
+        },
+      ],
+    });
+
+    const result = await retrieveChunks(
       Array(3072).fill(0.1),
       "https://example.com",
-      5
+      1
     );
 
-    expect(qdrantClient.query.mock.calls[0][1].limit).toBe(5);
+    expect(result.documents[0]).toEqual(["Valid content chunk 1"]);
+    expect(result.metadatas[0][0].url).toBe("https://example.com/feature1");
   });
 
   it("returns empty arrays when no chunks match", async () => {
