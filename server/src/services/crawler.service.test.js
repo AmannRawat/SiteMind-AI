@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 
 const mocks = vi.hoisted(() => ({
   scrapeWebsite: vi.fn(),
+  createBrowserSession: vi.fn(),
   chunkText: vi.fn(),
   generateVectorEmbedding: vi.fn(),
   storeChunk: vi.fn(),
@@ -18,6 +19,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("./scraper.service.js", () => ({
   scrapeWebsite: mocks.scrapeWebsite,
+  createBrowserSession: mocks.createBrowserSession,
 }));
 
 vi.mock("./chunking.service.js", () => ({
@@ -69,6 +71,11 @@ describe("crawlWebsite", () => {
     mocks.getPageCheckpoint.mockResolvedValue(null);
     mocks.getPageState.mockResolvedValue(null);
 
+    mocks.createBrowserSession.mockReturnValue({
+      close: vi.fn().mockResolvedValue(undefined),
+      totalLaunchDurationMs: 0,
+    });
+
     mocks.scrapeWebsite.mockResolvedValue({
       head: defaultHead,
       body: defaultBody,
@@ -109,7 +116,7 @@ describe("crawlWebsite", () => {
 
     const result = await crawlWebsite(url, { jobId });
 
-    expect(mocks.scrapeWebsite).toHaveBeenCalledWith(url);
+    expect(mocks.scrapeWebsite).toHaveBeenCalledWith(url, expect.anything());
     expect(mocks.generateVectorEmbedding).toHaveBeenCalledTimes(3);
     expect(mocks.storeChunk).toHaveBeenCalledTimes(3);
 
@@ -277,10 +284,12 @@ describe("crawlWebsite", () => {
 
     expect(mocks.scrapeWebsite).toHaveBeenCalledTimes(2);
     expect(mocks.scrapeWebsite).toHaveBeenCalledWith(
-      "https://example.com/"
+      "https://example.com/",
+      expect.anything()
     );
     expect(mocks.scrapeWebsite).toHaveBeenCalledWith(
-      "https://example.com/about"
+      "https://example.com/about",
+      expect.anything()
     );
 
     expect(mocks.scrapeWebsite).not.toHaveBeenCalledWith(

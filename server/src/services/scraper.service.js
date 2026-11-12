@@ -11,7 +11,7 @@ const MAX_REDIRECTS = 5;
 
 // Browser limits
 const BROWSER_TIMEOUT_MS = 15_000;
-const BROWSER_OPERATION_TIMEOUT_MS = 18_000;
+const BROWSER_OPERATION_TIMEOUT_MS = 25_000;
 const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
 const BROWSER_HYDRATION_TIMEOUT_MS = 5_000;
 
@@ -354,54 +354,154 @@ function withTimeout(promise, timeoutMs, message, onTimeout) {
 }
 
 // --------------------------------------------------
+// Browser lifecycle and session management
+// --------------------------------------------------
+
+async function launchPuppeteerBrowser() {
+    let launchTimedOut = false;
+
+    const launchPromise = puppeteer.launch({
+        headless: true,
+        args: [
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-extensions",
+            "--disable-sync",
+            "--disable-gpu",
+            "--no-zygote",
+            "--mute-audio",
+            "--no-first-run",
+            "--disable-speech-api",
+            ...(process.env.PUPPETEER_NO_SANDBOX === "true"
+                ? ["--no-sandbox", "--disable-setuid-sandbox"]
+                : []),
+        ],
+    }).then((launchedBrowser) => {
+        // If launch finishes after its timeout, clean up the late browser.
+        if (launchTimedOut) {
+            void closeBrowserSafely(launchedBrowser);
+        }
+
+        return launchedBrowser;
+    });
+
+    return await withTimeout(
+        launchPromise,
+        BROWSER_TIMEOUT_MS,
+        "Browser launch timed out.",
+        () => {
+            launchTimedOut = true;
+        },
+    );
+}
+
+export class CrawlBrowserSession {
+    constructor() {
+        this.browser = null;
+        this.releaseSlot = null;
+        this.closed = false;
+        this.totalLaunchDurationMs = 0;
+    }
+
+    async getBrowser() {
+        if (this.closed) {
+            throw new Error("Browser session has already been closed.");
+        }
+
+        const isConnected =
+            this.browser &&
+            (typeof this.browser.isConnected === "function"
+                ? this.browser.isConnected()
+                : true);
+
+        if (isConnected) {
+            return {
+                browser: this.browser,
+                isReused: true,
+                launchDurationMs: 0,
+            };
+        }
+
+        if (this.browser) {
+            console.warn(
+                "[Scraper] Existing browser instance is disconnected. Cleaning up before relaunch...",
+            );
+            await closeBrowserSafely(this.browser).catch(() => {});
+            this.browser = null;
+        }
+
+        if (!this.releaseSlot) {
+            this.releaseSlot = await acquireBrowserSlot();
+        }
+
+        const launchStart = Date.now();
+        try {
+            this.browser = await launchPuppeteerBrowser();
+        } catch (error) {
+            if (this.releaseSlot) {
+                const release = this.releaseSlot;
+                this.releaseSlot = null;
+                release();
+            }
+            throw error;
+        }
+
+        const launchDurationMs = Date.now() - launchStart;
+        this.totalLaunchDurationMs += launchDurationMs;
+
+        return {
+            browser: this.browser,
+            isReused: false,
+            launchDurationMs,
+        };
+    }
+
+    async close() {
+        if (this.closed) return;
+        this.closed = true;
+
+        try {
+            if (this.browser) {
+                await closeBrowserSafely(this.browser);
+            }
+        } finally {
+            this.browser = null;
+            if (this.releaseSlot) {
+                const release = this.releaseSlot;
+                this.releaseSlot = null;
+                release();
+            }
+        }
+    }
+}
+
+export function createBrowserSession() {
+    return new CrawlBrowserSession();
+}
+
+// --------------------------------------------------
 // Browser scraper
 // --------------------------------------------------
 
-export async function scrapeReactWebsite(inputUrl) {
-    const releaseBrowserSlot = await acquireBrowserSlot();
+export async function scrapeReactWebsite(inputUrl, options = {}) {
+    const session = options.browserSession || new CrawlBrowserSession();
+    const ownsSession = !options.browserSession;
 
-    let browser;
-    let launchTimedOut = false;
+    let page;
+    let pageCleanupDurationMs = 0;
+    const pageStart = Date.now();
 
     try {
         const url = await validateUrl(inputUrl);
 
-        const launchPromise = puppeteer.launch({
-            headless: true,
-            args: [
-                "--disable-dev-shm-usage",
-                "--disable-background-networking",
-                "--disable-extensions",
-                "--disable-sync",
-                "--disable-gpu",
-                "--no-zygote",
-                "--mute-audio",
-                "--no-first-run",
-                "--disable-speech-api",
-                ...(process.env.PUPPETEER_NO_SANDBOX === "true"
-                    ? ["--no-sandbox", "--disable-setuid-sandbox"]
-                    : []),
-            ],
-        }).then((launchedBrowser) => {
-            // If launch finishes after its timeout, clean up the late browser.
-            if (launchTimedOut) {
-                void closeBrowserSafely(launchedBrowser);
-            }
+        const { browser, isReused, launchDurationMs } = await session.getBrowser();
 
-            return launchedBrowser;
-        });
-
-        browser = await withTimeout(
-            launchPromise,
-            BROWSER_TIMEOUT_MS,
-            "Browser launch timed out.",
-            () => {
-                launchTimedOut = true;
-            },
-        );
+        let navDurationMs = 0;
+        let hydrationDurationMs = 0;
+        let extractionDurationMs = 0;
 
         const scrapeOperation = async () => {
-            const page = await browser.newPage();
+            page = await browser.newPage();
 
             try {
                 page.setDefaultNavigationTimeout(BROWSER_TIMEOUT_MS);
@@ -481,15 +581,18 @@ export async function scrapeReactWebsite(inputUrl) {
                     })();
                 });
 
+                const navStart = Date.now();
                 await page.goto(url, {
                     waitUntil: "domcontentloaded",
                     timeout: BROWSER_TIMEOUT_MS,
                 });
+                navDurationMs = Date.now() - navStart;
 
                 // Wait for client-side JavaScript / SPA hydration (React, Vue, Vite, etc.)
                 // to render readable content into the DOM before extracting.
                 // Do not accept a merely non-empty root/loading splash as proof of completion.
                 if (typeof page.waitForFunction === "function") {
+                    const hydrationStart = Date.now();
                     try {
                         await page.waitForFunction(
                             (minUsefulLength) => {
@@ -522,9 +625,12 @@ export async function scrapeReactWebsite(inputUrl) {
                     } catch {
                         // Hydration wait timed out or threshold was not met before timeout;
                         // fall through to final DOM extraction and let hasUsefulContent decide whether to fail.
+                    } finally {
+                        hydrationDurationMs = Date.now() - hydrationStart;
                     }
                 }
 
+                const extractStart = Date.now();
                 const result = await page.evaluate(() => {
                     const title = document.title || "";
                     const metaDescription =
@@ -572,11 +678,22 @@ export async function scrapeReactWebsite(inputUrl) {
                     }
                 }
 
+                extractionDurationMs = Date.now() - extractStart;
+
                 const scraped = {
                     head: result.head.replace(/\s+/g, " ").trim(),
                     body: result.body.replace(/\s+/g, " ").trim(),
                     internalLinks: [...internalLinks],
                     externalLinks: [...externalLinks],
+                    timings: {
+                        isBrowserReused: isReused,
+                        launchDurationMs,
+                        navigationDurationMs: navDurationMs,
+                        hydrationDurationMs,
+                        extractionDurationMs,
+                        pageCleanupDurationMs: 0,
+                        totalPageDurationMs: 0,
+                    },
                 };
 
                 if (!hasUsefulContent(scraped)) {
@@ -587,9 +704,7 @@ export async function scrapeReactWebsite(inputUrl) {
 
                 return scraped;
             } finally {
-                // Browser shutdown also closes its open pages.
-                // This page cleanup is best-effort and does not delay
-                // the overall browser timeout indefinitely.
+                const cleanupStart = Date.now();
                 try {
                     await withTimeout(
                         page.close(),
@@ -598,19 +713,53 @@ export async function scrapeReactWebsite(inputUrl) {
                     );
                 } catch {
                     // Browser-level cleanup runs in the outer finally.
+                } finally {
+                    pageCleanupDurationMs = Date.now() - cleanupStart;
+                    page = null;
                 }
             }
         };
 
-        return await withTimeout(
+        const scraped = await withTimeout(
             scrapeOperation(),
             BROWSER_OPERATION_TIMEOUT_MS,
             `Browser scrape exceeded ${BROWSER_OPERATION_TIMEOUT_MS}ms.`,
-            () => closeBrowserSafely(browser),
+            () => {
+                if (ownsSession) {
+                    void closeBrowserSafely(browser);
+                }
+            },
         );
+
+        if (scraped && scraped.timings) {
+            scraped.timings.pageCleanupDurationMs = pageCleanupDurationMs;
+            scraped.timings.totalPageDurationMs = Date.now() - pageStart;
+
+            console.log(
+                `[Scraper] Timings for ${url} (browser reused: ${isReused}) - ` +
+                `launch: ${scraped.timings.launchDurationMs}ms, ` +
+                `nav: ${scraped.timings.navigationDurationMs}ms, ` +
+                `hydration: ${scraped.timings.hydrationDurationMs}ms, ` +
+                `extract: ${scraped.timings.extractionDurationMs}ms, ` +
+                `cleanup: ${scraped.timings.pageCleanupDurationMs}ms, ` +
+                `total: ${scraped.timings.totalPageDurationMs}ms`
+            );
+        }
+
+        return scraped;
     } finally {
-        await closeBrowserSafely(browser);
-        releaseBrowserSlot();
+        if (page) {
+            try {
+                await withTimeout(
+                    page.close(),
+                    BROWSER_CLOSE_TIMEOUT_MS,
+                    "Page close timed out.",
+                );
+            } catch {}
+        }
+        if (ownsSession) {
+            await session.close();
+        }
     }
 }
 
@@ -618,7 +767,7 @@ export async function scrapeReactWebsite(inputUrl) {
 // Adaptive scraper: static first, browser fallback
 // --------------------------------------------------
 
-export async function scrapeWebsite(url) {
+export async function scrapeWebsite(url, options = {}) {
     let staticError;
 
     try {
@@ -653,7 +802,7 @@ export async function scrapeWebsite(url) {
     }
 
     try {
-        const result = await scrapeReactWebsite(url);
+        const result = await scrapeReactWebsite(url, options);
 
         console.log(`[Scraper] Browser extraction succeeded: ${url}`);
 

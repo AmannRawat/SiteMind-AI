@@ -1,6 +1,6 @@
 
 import { createHash } from "node:crypto";
-import { scrapeWebsite } from "./scraper.service.js";
+import { scrapeWebsite, createBrowserSession } from "./scraper.service.js";
 import { chunkText } from "./chunking.service.js";
 import { generateVectorEmbedding } from "./embedding.service.js";
 import {
@@ -137,9 +137,13 @@ export async function crawlWebsite(startUrl, options = {}) {
     const queue = [{ url: start, depth: 0 }];
     const queued = new Set([start]);
 
+    const browserSession = createBrowserSession();
+    const pageTimings = [];
+
     try {
-        while (queue.length > 0) {
-            checkDeadline();
+        try {
+            while (queue.length > 0) {
+                checkDeadline();
 
             if (visited.size >= maxPages) break;
 
@@ -267,8 +271,15 @@ export async function crawlWebsite(startUrl, options = {}) {
             try {
                 // Axios + Cheerio first; Puppeteer fallback is handled
                 // inside scrapeWebsite().
-                scraped = await scrapeWebsite(normalizedUrl);
+                scraped = await scrapeWebsite(normalizedUrl, { browserSession });
                 checkDeadline();
+
+                if (scraped?.timings) {
+                    pageTimings.push({
+                        url: normalizedUrl,
+                        ...scraped.timings,
+                    });
+                }
             } catch (error) {
                 if (error instanceof CrawlDeadlineError) {
                     throw error;
@@ -516,5 +527,13 @@ export async function crawlWebsite(startUrl, options = {}) {
         status,
         timedOut,
         durationMs: Date.now() - startedAt,
+        timings: {
+            totalDurationMs: Date.now() - startedAt,
+            browserLaunchDurationMs: browserSession.totalLaunchDurationMs,
+            pageTimings,
+        },
     };
+    } finally {
+        await browserSession.close();
+    }
 }
