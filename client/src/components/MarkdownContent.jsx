@@ -63,7 +63,7 @@ export function MarkdownContent({ content }) {
               {children}
             </pre>
           ),
-          code: ({ className, children, ...props }) => {
+          code: ({ _className, children, ...props }) => {
             return (
               <code
                 className="rounded bg-[#262626] px-1.5 py-0.5 font-mono text-xs text-[#FF6B6B]"

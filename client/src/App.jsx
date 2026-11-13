@@ -19,15 +19,18 @@ import {
 import { Analytics } from '@vercel/analytics/react';
 import posthog from "./posthog.js";
 import { MarkdownContent } from "./components/MarkdownContent.jsx";
+import { BackendStatusBanner } from "./components/BackendStatusBanner.jsx";
+import { useBackendHealth } from "./hooks/useBackendHealth.js";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000";
 
-export default function App() {
+export default function App({ healthOptions } = {}) {
   const [url, setUrl] = useState("");
   const [job, setJob] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [apiStatus, setApiStatus] = useState("checking");
+
+  const backendHealth = useBackendHealth(healthOptions);
 
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
@@ -61,36 +64,6 @@ export default function App() {
   const partiallyCompleted = completed && crawlResultStatus === "partial";
   const active = Boolean(job && !completed && !failed);
   const websiteUrl = job?.url || job?.result?.websiteUrl || "";
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function checkHealth() {
-      try {
-        const response = await fetch(`${API_URL}/health`);
-
-        if (!response.ok) {
-          throw new Error("Health check failed");
-        }
-
-        if (!cancelled) {
-          setApiStatus("online");
-        }
-      } catch {
-        if (!cancelled) {
-          // A failed fetch may be caused by an extension(UBLOCK ORIGIN) or network issue.
-          // It does not prove the entire API is offline.
-          setApiStatus("unknown");
-        }
-      }
-    }
-
-    checkHealth();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (!job?.jobId || completed || failed) return;
@@ -146,6 +119,21 @@ export default function App() {
       setUrl(targetUrl);
     }
 
+    // Guard if backend is currently waking up or unavailable
+    if (backendHealth.status === "waking" || backendHealth.status === "checking") {
+      setError(
+        "Demo server is currently waking up. Please wait a moment until connection is established before starting a crawl."
+      );
+      return;
+    }
+
+    if (backendHealth.status === "unavailable") {
+      setError(
+        "Demo server is currently offline. Please click 'Retry connection' above or try again shortly."
+      );
+      return;
+    }
+
     setJob(null);
     setMessages([]);
     setQuestion("");
@@ -177,11 +165,19 @@ export default function App() {
       posthog.logger.info("crawl request accepted", { source: "web" });
     } catch (err) {
       posthog.capture("crawl_start_failed");
-      setError(
-        err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError")
-          ? `Could not reach the SiteMind API at ${API_URL}. Please ensure the backend server is running.`
-          : err.message || "Could not connect to the API."
-      );
+      const isNetworkErr =
+        err.message?.includes("Failed to fetch") ||
+        err.message?.includes("NetworkError") ||
+        err.name === "TypeError";
+
+      if (isNetworkErr) {
+        backendHealth.reportNetworkError();
+        setError(
+          `Could not reach the SiteMind API at ${API_URL}. The demo server may have gone to sleep; we are attempting to re-establish connection.`
+        );
+      } else {
+        setError(err.message || "Could not connect to the API.");
+      }
     } finally {
       setLoading(false);
     }
@@ -193,6 +189,11 @@ export default function App() {
     const userQuestion = question.trim();
 
     if (!userQuestion || !websiteUrl || chatLoading) return;
+
+    if (backendHealth.status === "waking" || backendHealth.status === "unavailable") {
+      setError("Demo server is reconnecting. Please wait a moment before sending your question.");
+      return;
+    }
 
     posthog.capture("chat_question_submitted");
     setError("");
@@ -236,7 +237,21 @@ export default function App() {
       posthog.capture("chat_answer_received");
       posthog.logger.info("chat answer displayed", { source: "web" });
     } catch (err) {
-      setError(err.message || "Could not reach the chat API.");
+      const isNetworkErr =
+        err.message?.includes("Failed to fetch") ||
+        err.message?.includes("NetworkError") ||
+        err.name === "TypeError";
+
+      if (isNetworkErr) {
+        backendHealth.reportNetworkError();
+        // Preserve user question so it isn't lost
+        setQuestion(userQuestion);
+        setError(
+          "Lost connection to the demo server while sending question. Server is reconnecting; your question has been preserved."
+        );
+      } else {
+        setError(err.message || "Could not reach the chat API.");
+      }
     } finally {
       setChatLoading(false);
     }
@@ -289,35 +304,49 @@ export default function App() {
           <div
             className="flex items-center gap-2 rounded-full border border-[#292929] bg-[#141414] px-3 py-1.5 text-xs text-[#A3A3A3]"
             title={
-              apiStatus === "online"
+              backendHealth.status === "online"
                 ? "Health endpoint responded successfully"
-                : apiStatus === "checking"
-                  ? "Checking API health"
-                  : "Health check unavailable; the API may still be working"
+                : backendHealth.status === "waking"
+                  ? "Demo server is spinning up after inactivity"
+                  : backendHealth.status === "checking"
+                    ? "Checking API health"
+                    : "Demo server is offline or unreachable"
             }
           >
             <span
-              className={`h-2 w-2 rounded-full ${apiStatus === "online"
-                ? "bg-[#22C55E] ring-2 ring-[#22C55E]/30"
-                : apiStatus === "checking"
-                  ? "bg-[#EAB308] ring-2 ring-[#EAB308]/30"
-                  : "bg-[#737373] ring-2 ring-[#737373]/30"
-                }`}
+              className={`h-2 w-2 rounded-full ${
+                backendHealth.status === "online"
+                  ? "bg-[#22C55E] ring-2 ring-[#22C55E]/30"
+                  : backendHealth.status === "waking"
+                    ? "bg-[#EAB308] ring-2 ring-[#EAB308]/30 animate-pulse motion-reduce:animate-none"
+                    : backendHealth.status === "checking"
+                      ? "bg-[#EAB308] ring-2 ring-[#EAB308]/30"
+                      : "bg-[#EF4444] ring-2 ring-[#EF4444]/30"
+              }`}
               aria-hidden="true"
             />
             <span>
-              {apiStatus === "online"
+              {backendHealth.status === "online"
                 ? "API connected"
-                : apiStatus === "checking"
-                  ? "Checking API"
-                  : "API status unknown"}
+                : backendHealth.status === "waking"
+                  ? "Waking server..."
+                  : backendHealth.status === "checking"
+                    ? "Checking API"
+                    : "Server offline"}
             </span>
           </div>
         </div>
       </header>
 
       {/* Hero & Form Section */}
-      <section className="mx-auto max-w-4xl px-4 pb-16 pt-10 sm:px-6 sm:pt-14">
+      <section className="mx-auto max-w-4xl px-4 pb-16 pt-8 sm:px-6 sm:pt-12">
+        {/* Backend Cold-Start / Connectivity Notice */}
+        <BackendStatusBanner
+          status={backendHealth.status}
+          retryCount={backendHealth.retryCount}
+          onRetry={backendHealth.manualRetry}
+        />
+
         {/* Hero Copy */}
         <div className="mx-auto max-w-2xl text-center">
           <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-[#292929] bg-[#141414] px-3.5 py-1 text-xs font-medium text-[#A3A3A3]">
@@ -367,15 +396,30 @@ export default function App() {
 
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || backendHealth.status === "waking" || backendHealth.status === "unavailable"}
+              title={
+                backendHealth.status === "waking"
+                  ? "Demo server is waking up; please wait a moment..."
+                  : backendHealth.status === "unavailable"
+                    ? "Demo server is currently offline"
+                    : undefined
+              }
               className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-[#FF2A2A] px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#FF5C5C] active:bg-[#D32F2F] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2A2A] focus-visible:ring-offset-2 focus-visible:ring-offset-[#090909] disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
             >
               {loading ? (
                 <LoaderCircle className="animate-spin" size={17} aria-hidden="true" />
+              ) : backendHealth.status === "waking" ? (
+                <LoaderCircle className="animate-spin motion-reduce:animate-none" size={17} aria-hidden="true" />
               ) : (
                 <Search size={17} aria-hidden="true" />
               )}
-              <span>{loading ? "Starting..." : "Start crawl"}</span>
+              <span>
+                {loading
+                  ? "Starting..."
+                  : backendHealth.status === "waking"
+                    ? "Waking up server..."
+                    : "Start crawl"}
+              </span>
             </button>
           </div>
 
@@ -722,8 +766,20 @@ export default function App() {
 
                 <button
                   type="submit"
-                  disabled={chatLoading || !question.trim()}
+                  disabled={
+                    chatLoading ||
+                    !question.trim() ||
+                    backendHealth.status === "waking" ||
+                    backendHealth.status === "unavailable"
+                  }
                   aria-label="Send question"
+                  title={
+                    backendHealth.status === "waking"
+                      ? "Demo server is reconnecting; please wait..."
+                      : backendHealth.status === "unavailable"
+                        ? "Demo server is offline"
+                        : "Send question"
+                  }
                   className="mb-1 rounded-md bg-[#FF2A2A] p-2 text-white transition-colors hover:bg-[#FF5C5C] active:bg-[#D32F2F] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2A2A] disabled:cursor-not-allowed disabled:opacity-40 shrink-0 cursor-pointer"
                 >
                   {chatLoading ? (
